@@ -1,0 +1,46 @@
+# Virtual Mouse Configuration
+# Modify these settings to customize behavior
+
+camera:
+  # Video source: integer for webcam index, or string for RTSP URL
+  # Examples:
+  #   source: 0                                    # Default webcam
+  #   source: 1                                    # External USB camera
+  #   source: "rtsp://192.168.1.100:554/stream"   # RTSP stream
+  source: 0
+  width: 640
+  height: 480
+  flip_horizontal: true   # Mirror the video (recommended for intuitive control)
+
+gesture:
+  # MediaPipe detection confidence thresholds
+  detection_confidence: 0.7
+  tracking_confidence: 0.5
+  
+  # Cursor smoothing (0.0 = no smoothing, 1.0 = maximum smoothing)
+  smoothing_factor: 0.3
+  
+  # Gesture stability (frames to wait before confirming gesture change)
+  stability_frames: 4
+
+display:
+  show_preview: true      # Show camera preview window
+  show_landmarks: true    # Draw hand skeleton on preview
+  show_gesture: true      # Display current detected gesture
+  preview_scale: 1.0      # Scale factor for preview window
+
+mouse:
+  # Screen region for mouse control (use full screen by default)
+  # Set these to limit cursor movement to a specific region
+  screen_region:
+    enabled: false
+    x: 0
+    y: 0
+    width: 1920
+    height: 1080
+  
+  # Movement sensitivity multiplier
+  sensitivity: 1.0
+  
+  # Click debounce time (seconds) - prevents accidental double clicks
+  click_debounce: 0.3
