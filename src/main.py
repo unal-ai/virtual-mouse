@@ -197,15 +197,16 @@ def run_virtual_mouse(config_path: Optional[str] = None,
                     continue
                 break
             
-            # Process frame for hand detection
-            hands_detected = detector.process(frame)
+            # Submit frame for async processing (non-blocking)
+            detector.process_async(frame)
             
-            # Get current gesture and handle it
-            gesture = Gesture.PALM
+            # Get latest detection result (may be from previous frame)
+            hands_detected, gesture, hand = detector.get_latest_result()
+            
+            # Handle gesture
             action = "No Hand"
             
             if hands_detected:
-                gesture, hand = detector.get_gesture()
                 position = hand.get_landmark_position(9) if hand else None
                 action = controller.handle_gesture(gesture, position)
             else:

@@ -1,8 +1,11 @@
 """Cross-platform mouse controller for Virtual Mouse.
 
-Uses PyAutoGUI for mouse control with cursor smoothing and debouncing.
+Uses PyAutoGUI with threading to prevent blocking the main loop.
+Mouse operations run in a dedicated thread for consistent frame rates.
 """
 
+import queue
+import threading
 import time
 from typing import Optional, Tuple, Callable
 
@@ -12,15 +15,96 @@ from .config import MouseConfig
 from .gestures import Gesture
 
 
-# Disable PyAutoGUI fail-safe (moving mouse to corner won't stop program)
+# Disable PyAutoGUI fail-safe
 pyautogui.FAILSAFE = False
-
-# Set movement duration to 0 for instant response
 pyautogui.MOVETO_DURATION = 0
 
 
+class OneEuroFilter:
+    """One Euro Filter for smooth, low-latency cursor tracking.
+    
+    Adaptive low-pass filter that:
+    - Filters aggressively during slow movement (removes jitter)
+    - Responds instantly during fast movement (low latency)
+    
+    Reference: https://cristal.univ-lille.fr/~casiez/1euro/
+    """
+    
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.007, d_cutoff: float = 1.0):
+        """Initialize filter.
+        
+        Args:
+            min_cutoff: Minimum cutoff frequency (lower = more smoothing when slow)
+            beta: Speed coefficient (higher = less smoothing when fast)
+            d_cutoff: Derivative cutoff frequency
+        """
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        
+        self.x_prev: Optional[float] = None
+        self.dx_prev: float = 0.0
+        self.t_prev: Optional[float] = None
+    
+    def _smoothing_factor(self, t_e: float, cutoff: float) -> float:
+        """Compute exponential smoothing factor."""
+        r = 2 * 3.14159 * cutoff * t_e
+        return r / (r + 1)
+    
+    def _exp_smooth(self, a: float, x: float, x_prev: float) -> float:
+        """Apply exponential smoothing."""
+        return a * x + (1 - a) * x_prev
+    
+    def filter(self, x: float, t: Optional[float] = None) -> float:
+        """Filter a value.
+        
+        Args:
+            x: Input value
+            t: Timestamp (uses time.time() if not provided)
+        
+        Returns:
+            Filtered value
+        """
+        if t is None:
+            t = time.time()
+        
+        if self.x_prev is None:
+            self.x_prev = x
+            self.t_prev = t
+            return x
+        
+        t_e = t - self.t_prev
+        if t_e <= 0:
+            t_e = 1e-6
+        
+        # Estimate derivative
+        dx = (x - self.x_prev) / t_e
+        a_d = self._smoothing_factor(t_e, self.d_cutoff)
+        dx_hat = self._exp_smooth(a_d, dx, self.dx_prev)
+        
+        # Adaptive cutoff based on speed
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)
+        
+        # Filter the value
+        a = self._smoothing_factor(t_e, cutoff)
+        x_hat = self._exp_smooth(a, x, self.x_prev)
+        
+        # Update state
+        self.x_prev = x_hat
+        self.dx_prev = dx_hat
+        self.t_prev = t
+        
+        return x_hat
+    
+    def reset(self) -> None:
+        """Reset filter state."""
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+
 class MouseController:
-    """Cross-platform mouse controller with smoothing and gesture handling."""
+    """Cross-platform mouse controller with threading and smoothing."""
     
     def __init__(self, config: MouseConfig):
         """Initialize mouse controller.
@@ -33,73 +117,89 @@ class MouseController:
         # Screen dimensions
         self.screen_width, self.screen_height = pyautogui.size()
         
-        # Previous position for smoothing
-        self.prev_x: Optional[float] = None
-        self.prev_y: Optional[float] = None
+        # One Euro Filters for smooth, low-latency tracking
+        # min_cutoff=1.0: smooth when slow, beta=0.007: responsive when fast
+        self._filter_x = OneEuroFilter(min_cutoff=1.0, beta=0.007)
+        self._filter_y = OneEuroFilter(min_cutoff=1.0, beta=0.007)
+        
+        # Track current cursor position
+        self._curr_x: float = self.screen_width / 2
+        self._curr_y: float = self.screen_height / 2
         
         # State flags
         self.is_dragging: bool = False
-        self.click_ready: bool = False  # Flag for click confirmation
+        self.click_ready: bool = False
         self.last_click_time: float = 0
         
         # Pinch control state
         self.pinch_active: bool = False
         self.pinch_start_x: float = 0
         self.pinch_start_y: float = 0
-        self.pinch_direction: Optional[str] = None  # 'horizontal' or 'vertical'
+        self.pinch_direction: Optional[str] = None
         self.prev_pinch_level: float = 0
         self.pinch_frame_count: int = 0
+        
+        # Threading: command queue and worker thread
+        self._command_queue: queue.Queue = queue.Queue()
+        self._running = True
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
     
-    def _smooth_position(self, x: float, y: float) -> Tuple[float, float]:
-        """Apply smoothing to cursor position to reduce jitter.
+    def _worker_loop(self) -> None:
+        """Worker thread that processes mouse commands."""
+        while self._running:
+            try:
+                # Get command with timeout to allow clean shutdown
+                cmd = self._command_queue.get(timeout=0.1)
+                if cmd is None:
+                    break
+                
+                action, args = cmd
+                
+                if action == 'move':
+                    pyautogui.moveTo(args[0], args[1])
+                elif action == 'click':
+                    pyautogui.click()
+                elif action == 'right_click':
+                    pyautogui.click(button='right')
+                elif action == 'double_click':
+                    pyautogui.doubleClick()
+                elif action == 'mouse_down':
+                    pyautogui.mouseDown()
+                elif action == 'mouse_up':
+                    pyautogui.mouseUp()
+                elif action == 'scroll':
+                    pyautogui.scroll(args[0])
+                elif action == 'hscroll':
+                    pyautogui.keyDown('shift')
+                    pyautogui.scroll(args[0])
+                    pyautogui.keyUp('shift')
+                
+                self._command_queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception:
+                pass  # Ignore errors in worker thread
+    
+    def _send_command(self, action: str, *args) -> None:
+        """Send a command to the worker thread (non-blocking)."""
+        # Drop old move commands to avoid queue buildup
+        if action == 'move':
+            # Clear any pending move commands
+            try:
+                while True:
+                    cmd = self._command_queue.get_nowait()
+                    if cmd and cmd[0] != 'move':
+                        # Put non-move commands back
+                        self._command_queue.put(cmd)
+                        break
+            except queue.Empty:
+                pass
         
-        Args:
-            x: Target x position.
-            y: Target y position.
-        
-        Returns:
-            Smoothed (x, y) position.
-        """
-        if self.prev_x is None or self.prev_y is None:
-            self.prev_x = x
-            self.prev_y = y
-            return x, y
-        
-        # Calculate delta
-        delta_x = x - self.prev_x
-        delta_y = y - self.prev_y
-        dist_sq = delta_x ** 2 + delta_y ** 2
-        
-        # Adaptive smoothing based on movement speed
-        if dist_sq <= 25:
-            # Very small movement - ignore (reduces jitter)
-            ratio = 0
-        elif dist_sq <= 900:
-            # Medium movement - smooth
-            ratio = 0.07 * (dist_sq ** 0.5)
-        else:
-            # Large movement - respond quickly
-            ratio = 2.1
-        
-        # Get current position
-        curr_x, curr_y = pyautogui.position()
-        
-        # Calculate new position
-        new_x = curr_x + delta_x * ratio * self.config.sensitivity
-        new_y = curr_y + delta_y * ratio * self.config.sensitivity
-        
-        # Update previous position
-        self.prev_x = x
-        self.prev_y = y
-        
-        return new_x, new_y
+        self._command_queue.put((action, args))
     
     def _can_click(self) -> bool:
-        """Check if enough time has passed since last click for debouncing.
-        
-        Returns:
-            True if click is allowed.
-        """
+        """Check if enough time has passed since last click."""
         current_time = time.time()
         if current_time - self.last_click_time >= self.config.click_debounce:
             self.last_click_time = current_time
@@ -107,13 +207,12 @@ class MouseController:
         return False
     
     def move_cursor(self, norm_x: float, norm_y: float) -> None:
-        """Move cursor to normalized position.
+        """Move cursor to normalized position (non-blocking).
         
-        Args:
-            norm_x: Normalized x position (0-1).
-            norm_y: Normalized y position (0-1).
+        Uses One Euro Filter for adaptive smoothing:
+        - Slow movement -> strong smoothing (removes jitter)
+        - Fast movement -> weak smoothing (responsive)
         """
-        # Convert normalized to screen coordinates
         if self.config.screen_region.enabled:
             region = self.config.screen_region
             x = region.x + norm_x * region.width
@@ -122,71 +221,56 @@ class MouseController:
             x = norm_x * self.screen_width
             y = norm_y * self.screen_height
         
-        # Apply smoothing
-        smooth_x, smooth_y = self._smooth_position(x, y)
+        # Apply One Euro Filter for smooth, low-latency tracking
+        t = time.time()
+        smooth_x = self._filter_x.filter(x, t)
+        smooth_y = self._filter_y.filter(y, t)
         
-        # Clamp to screen bounds
         smooth_x = max(0, min(self.screen_width - 1, smooth_x))
         smooth_y = max(0, min(self.screen_height - 1, smooth_y))
         
-        # Move cursor
-        pyautogui.moveTo(int(smooth_x), int(smooth_y))
+        self._curr_x = smooth_x
+        self._curr_y = smooth_y
+        
+        self._send_command('move', int(smooth_x), int(smooth_y))
     
     def left_click(self) -> None:
-        """Perform left mouse click."""
+        """Perform left click (non-blocking)."""
         if self._can_click():
-            pyautogui.click()
+            self._send_command('click')
     
     def right_click(self) -> None:
-        """Perform right mouse click."""
+        """Perform right click (non-blocking)."""
         if self._can_click():
-            pyautogui.click(button='right')
+            self._send_command('right_click')
     
     def double_click(self) -> None:
-        """Perform double click."""
+        """Perform double click (non-blocking)."""
         if self._can_click():
-            pyautogui.doubleClick()
+            self._send_command('double_click')
     
     def start_drag(self) -> None:
         """Start drag operation."""
         if not self.is_dragging:
             self.is_dragging = True
-            pyautogui.mouseDown(button='left')
+            self._send_command('mouse_down')
     
     def stop_drag(self) -> None:
         """Stop drag operation."""
         if self.is_dragging:
             self.is_dragging = False
-            pyautogui.mouseUp(button='left')
+            self._send_command('mouse_up')
     
     def scroll_vertical(self, amount: int = 120) -> None:
-        """Scroll vertically.
-        
-        Args:
-            amount: Scroll amount (positive = up, negative = down).
-        """
-        pyautogui.scroll(amount)
+        """Scroll vertically (non-blocking)."""
+        self._send_command('scroll', amount)
     
     def scroll_horizontal(self, amount: int = 120) -> None:
-        """Scroll horizontally.
-        
-        Args:
-            amount: Scroll amount (positive = right, negative = left).
-        """
-        # Horizontal scroll using shift+ctrl+scroll
-        pyautogui.keyDown('shift')
-        pyautogui.keyDown('ctrl')
-        pyautogui.scroll(-amount)
-        pyautogui.keyUp('ctrl')
-        pyautogui.keyUp('shift')
+        """Scroll horizontally (non-blocking)."""
+        self._send_command('hscroll', -amount)
     
     def init_pinch_control(self, start_x: float, start_y: float) -> None:
-        """Initialize pinch control state.
-        
-        Args:
-            start_x: Starting x position of pinch.
-            start_y: Starting y position of pinch.
-        """
+        """Initialize pinch control state."""
         self.pinch_start_x = start_x
         self.pinch_start_y = start_y
         self.prev_pinch_level = 0
@@ -196,21 +280,12 @@ class MouseController:
     def update_pinch_control(self, current_x: float, current_y: float,
                             horizontal_action: Callable, 
                             vertical_action: Callable) -> None:
-        """Update pinch control based on hand movement.
-        
-        Args:
-            current_x: Current x position.
-            current_y: Current y position.
-            horizontal_action: Function to call for horizontal movement.
-            vertical_action: Function to call for vertical movement.
-        """
-        # Calculate movement from start
+        """Update pinch control based on hand movement."""
         dx = (current_x - self.pinch_start_x) * 10
         dy = (self.pinch_start_y - current_y) * 10
         
         threshold = 0.3
         
-        # Determine direction based on larger movement
         if abs(dy) > abs(dx) and abs(dy) > threshold:
             if self.pinch_direction is None:
                 self.pinch_direction = 'vertical'
@@ -242,40 +317,27 @@ class MouseController:
                     horizontal_action(120 if dx > 0 else -120)
     
     def handle_gesture(self, gesture: Gesture, hand_position: Optional[Tuple[float, float]]) -> str:
-        """Handle a detected gesture and perform corresponding action.
-        
-        Args:
-            gesture: The detected gesture.
-            hand_position: Normalized (x, y) position of the hand.
-        
-        Returns:
-            Description of the action taken.
-        """
+        """Handle a detected gesture and perform corresponding action."""
         action = "Idle"
         
-        # Reset states when gesture changes
         if gesture != Gesture.FIST and self.is_dragging:
             self.stop_drag()
         
         if gesture not in [Gesture.PINCH_MAJOR, Gesture.PINCH_MINOR] and self.pinch_active:
             self.pinch_active = False
         
-        # Handle gestures
         if gesture == Gesture.PALM:
-            # All fingers up - do nothing (stop)
             self.prev_x = None
             self.prev_y = None
             action = "Stop"
         
         elif gesture == Gesture.V_GEST:
-            # V gesture - move cursor
             self.click_ready = True
             if hand_position:
                 self.move_cursor(hand_position[0], hand_position[1])
                 action = "Moving Cursor"
         
         elif gesture == Gesture.FIST:
-            # Fist - drag
             if not self.is_dragging:
                 self.start_drag()
             if hand_position:
@@ -283,27 +345,21 @@ class MouseController:
             action = "Dragging"
         
         elif gesture == Gesture.TWO_FINGER_CLOSED and self.click_ready:
-            # Two fingers closed (from V-gesture) - LEFT CLICK
-            # This is the most natural: just close fingers from V-gesture
             self.left_click()
             self.click_ready = False
             action = "Left Click"
         
         elif gesture == Gesture.INDEX and self.click_ready:
-            # Index finger only (point) - RIGHT CLICK  
-            # Lower middle finger from V-gesture
             self.right_click()
             self.click_ready = False
             action = "Right Click"
         
         elif gesture == Gesture.PINCH_MAJOR and self.click_ready:
-            # Pinch with dominant hand - DOUBLE CLICK
             self.double_click()
             self.click_ready = False
             action = "Double Click"
         
         elif gesture == Gesture.PINCH_MINOR:
-            # Minor hand pinch - scroll
             if hand_position:
                 if not self.pinch_active:
                     self.pinch_active = True
@@ -316,7 +372,6 @@ class MouseController:
             action = "Scrolling"
         
         elif gesture == Gesture.MID:
-            # Middle finger only - move cursor (alternative to V-gesture)
             self.click_ready = True
             if hand_position:
                 self.move_cursor(hand_position[0], hand_position[1])
@@ -326,8 +381,14 @@ class MouseController:
     
     def reset(self) -> None:
         """Reset controller state."""
-        self.prev_x = None
-        self.prev_y = None
+        self._filter_x.reset()
+        self._filter_y.reset()
         self.stop_drag()
         self.pinch_active = False
         self.click_ready = False
+    
+    def shutdown(self) -> None:
+        """Shutdown the worker thread."""
+        self._running = False
+        self._command_queue.put(None)
+        self._worker_thread.join(timeout=1.0)

@@ -1,23 +1,27 @@
 """Gesture recognition module for Virtual Mouse.
 
-Uses MediaPipe Hands for hand landmark detection and converts
+Uses MediaPipe Hand Landmarker (Tasks API) for hand landmark detection and converts
 landmarks into recognizable gestures for mouse control.
+
+This module uses LIVE_STREAM mode for asynchronous, non-blocking detection.
 """
 
 import math
+import os
+import threading
+import time
 from enum import IntEnum
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, NamedTuple
 
 import mediapipe as mp
-from google.protobuf.json_format import MessageToDict
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
 from .config import GestureConfig
 
 
-# MediaPipe solutions
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
+# Get the model path (in project root by default)
+MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hand_landmarker.task")
 
 
 class Gesture(IntEnum):
@@ -49,6 +53,24 @@ class HandLabel(IntEnum):
     MAJOR = 1  # Dominant hand (right for right-handed)
 
 
+class NormalizedLandmark(NamedTuple):
+    """Simple landmark container to mimic old API structure."""
+    x: float
+    y: float
+    z: float
+
+
+class HandLandmarksWrapper:
+    """Wrapper to provide the old .landmark interface for new API results."""
+    
+    def __init__(self, landmarks_list):
+        """Wrap a list of NormalizedLandmarks from new API."""
+        self.landmark = [
+            NormalizedLandmark(lm.x, lm.y, lm.z) 
+            for lm in landmarks_list
+        ]
+
+
 class HandRecognizer:
     """Recognizes gestures from hand landmarks."""
     
@@ -74,7 +96,7 @@ class HandRecognizer:
         """Update with new hand landmarks.
         
         Args:
-            hand_landmarks: MediaPipe hand landmarks.
+            hand_landmarks: HandLandmarksWrapper with landmarks.
         """
         self.hand_result = hand_landmarks
     
@@ -250,7 +272,10 @@ class HandRecognizer:
 
 
 class GestureDetector:
-    """Main gesture detection class using MediaPipe Hands."""
+    """Main gesture detection class using MediaPipe Hand Landmarker.
+    
+    Uses LIVE_STREAM mode for async, non-blocking detection.
+    """
     
     def __init__(self, config: GestureConfig):
         """Initialize gesture detector.
@@ -260,27 +285,131 @@ class GestureDetector:
         """
         self.config = config
         
-        # Initialize MediaPipe Hands
-        self.hands = mp_hands.Hands(
-            max_num_hands=2,
-            min_detection_confidence=config.detection_confidence,
-            min_tracking_confidence=config.tracking_confidence
+        # Thread-safe result storage
+        self._result_lock = threading.Lock()
+        self._latest_result = None
+        self._frame_timestamp_ms = 0
+        
+        # Initialize MediaPipe Hand Landmarker with LIVE_STREAM mode
+        base_options = python.BaseOptions(model_asset_path=MODEL_PATH)
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=2,
+            min_hand_detection_confidence=config.detection_confidence,
+            min_tracking_confidence=config.tracking_confidence,
+            running_mode=vision.RunningMode.LIVE_STREAM,
+            result_callback=self._on_detection_result
         )
+        self.hand_landmarker = vision.HandLandmarker.create_from_options(options)
         
         # Hand recognizers
         self.major_hand = HandRecognizer(HandLabel.MAJOR, config.stability_frames)
         self.minor_hand = HandRecognizer(HandLabel.MINOR, config.stability_frames)
         
-        # Results storage
-        self.results = None
-        self.major_landmarks = None
-        self.minor_landmarks = None
-        
         # Dominant hand setting (True = right-handed)
         self.dom_hand_right = True
+        
+        # For drawing landmarks (store raw results)
+        self._draw_landmarks_cache = None
     
+    def _on_detection_result(self, result, output_image, timestamp_ms: int) -> None:
+        """Callback for async detection results.
+        
+        Args:
+            result: HandLandmarkerResult from MediaPipe.
+            output_image: The input image (unused).
+            timestamp_ms: Timestamp of the processed frame.
+        """
+        with self._result_lock:
+            self._latest_result = result
+            self._draw_landmarks_cache = result.hand_landmarks if result else None
+    
+    def process_async(self, frame) -> None:
+        """Submit frame for asynchronous processing (non-blocking).
+        
+        Args:
+            frame: BGR image from OpenCV.
+        """
+        import cv2
+        
+        # Convert BGR to RGB
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        
+        # Create MediaPipe Image from numpy array
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+        
+        # Increment timestamp (must be monotonically increasing)
+        self._frame_timestamp_ms += 33  # ~30fps
+        
+        # Submit for async processing (non-blocking)
+        self.hand_landmarker.detect_async(mp_image, self._frame_timestamp_ms)
+    
+    def get_latest_result(self) -> Tuple[bool, Gesture, Optional[HandRecognizer]]:
+        """Get the latest detection result (thread-safe).
+        
+        Returns:
+            Tuple of (hands_detected, gesture, hand_recognizer).
+        """
+        with self._result_lock:
+            result = self._latest_result
+        
+        if result is None or len(result.hand_landmarks) == 0:
+            self.major_hand.update(None)
+            self.minor_hand.update(None)
+            return False, Gesture.PALM, None
+        
+        # Classify hands
+        major_landmarks, minor_landmarks = self._classify_hands_from_result(result)
+        
+        # Update recognizers
+        self.major_hand.update(major_landmarks)
+        self.minor_hand.update(minor_landmarks)
+        
+        # Get gesture (prioritize minor hand pinch)
+        minor_gesture = self.minor_hand.get_gesture()
+        if minor_gesture == Gesture.PINCH_MINOR:
+            return True, minor_gesture, self.minor_hand
+        
+        major_gesture = self.major_hand.get_gesture()
+        return True, major_gesture, self.major_hand
+    
+    def _classify_hands_from_result(self, result) -> Tuple[Optional[HandLandmarksWrapper], Optional[HandLandmarksWrapper]]:
+        """Classify detected hands as major or minor from result.
+        
+        Args:
+            result: HandLandmarkerResult from MediaPipe.
+        
+        Returns:
+            Tuple of (major_landmarks, minor_landmarks).
+        """
+        left = None
+        right = None
+        
+        for i, hand_landmarks in enumerate(result.hand_landmarks):
+            try:
+                handedness = result.handedness[i][0]
+                label = handedness.category_name
+                
+                wrapped = HandLandmarksWrapper(hand_landmarks)
+                
+                if label == 'Right':
+                    right = wrapped
+                else:
+                    left = wrapped
+            except (IndexError, AttributeError):
+                pass
+        
+        # Assign based on dominance
+        if self.dom_hand_right:
+            return right, left
+        else:
+            return left, right
+    
+    # Legacy sync method for compatibility
     def process(self, frame) -> bool:
-        """Process a video frame to detect hands.
+        """Process a video frame (legacy sync wrapper).
+        
+        For backwards compatibility. Calls async then immediately gets result.
         
         Args:
             frame: BGR image from OpenCV.
@@ -288,71 +417,20 @@ class GestureDetector:
         Returns:
             True if at least one hand was detected.
         """
-        import cv2
-        
-        # Convert BGR to RGB
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb_frame.flags.writeable = False
-        
-        # Process with MediaPipe
-        self.results = self.hands.process(rgb_frame)
-        
-        # Classify hands
-        self._classify_hands()
-        
-        # Update recognizers
-        self.major_hand.update(self.major_landmarks)
-        self.minor_hand.update(self.minor_landmarks)
-        
-        return self.results.multi_hand_landmarks is not None
-    
-    def _classify_hands(self) -> None:
-        """Classify detected hands as major (dominant) or minor."""
-        self.major_landmarks = None
-        self.minor_landmarks = None
-        
-        if self.results is None or self.results.multi_hand_landmarks is None:
-            return
-        
-        left = None
-        right = None
-        
-        for i, hand_landmarks in enumerate(self.results.multi_hand_landmarks):
-            try:
-                handedness = MessageToDict(self.results.multi_handedness[i])
-                label = handedness['classification'][0]['label']
-                
-                if label == 'Right':
-                    right = hand_landmarks
-                else:
-                    left = hand_landmarks
-            except (IndexError, KeyError):
-                pass
-        
-        # Assign based on dominance
-        if self.dom_hand_right:
-            self.major_landmarks = right
-            self.minor_landmarks = left
-        else:
-            self.major_landmarks = left
-            self.minor_landmarks = right
+        self.process_async(frame)
+        # Small delay to allow callback to fire
+        time.sleep(0.001)
+        has_hands, _, _ = self.get_latest_result()
+        return has_hands
     
     def get_gesture(self) -> Tuple[Gesture, Optional[HandRecognizer]]:
-        """Get the current gesture and the hand making it.
-        
-        Prioritizes pinch gesture from minor hand, otherwise uses major hand.
+        """Get the current gesture (legacy compatibility).
         
         Returns:
             Tuple of (gesture, hand_recognizer).
         """
-        minor_gesture = self.minor_hand.get_gesture()
-        
-        # Pinch from minor hand has priority (for scrolling)
-        if minor_gesture == Gesture.PINCH_MINOR:
-            return minor_gesture, self.minor_hand
-        
-        major_gesture = self.major_hand.get_gesture()
-        return major_gesture, self.major_hand
+        _, gesture, hand = self.get_latest_result()
+        return gesture, hand
     
     def draw_landmarks(self, frame) -> None:
         """Draw hand landmarks on the frame.
@@ -360,21 +438,43 @@ class GestureDetector:
         Args:
             frame: BGR image to draw on.
         """
-        if self.results is None or self.results.multi_hand_landmarks is None:
+        import cv2
+        
+        with self._result_lock:
+            landmarks_cache = self._draw_landmarks_cache
+        
+        if landmarks_cache is None or len(landmarks_cache) == 0:
             return
         
-        for hand_landmarks in self.results.multi_hand_landmarks:
-            mp_drawing.draw_landmarks(
-                frame,
-                hand_landmarks,
-                mp_hands.HAND_CONNECTIONS,
-                mp_drawing_styles.get_default_hand_landmarks_style(),
-                mp_drawing_styles.get_default_hand_connections_style()
-            )
+        height, width = frame.shape[:2]
+        
+        # Draw connections and landmarks manually
+        connections = [
+            (0, 1), (1, 2), (2, 3), (3, 4),  # Thumb
+            (0, 5), (5, 6), (6, 7), (7, 8),  # Index
+            (0, 9), (9, 10), (10, 11), (11, 12),  # Middle
+            (0, 13), (13, 14), (14, 15), (15, 16),  # Ring
+            (0, 17), (17, 18), (18, 19), (19, 20),  # Pinky
+            (5, 9), (9, 13), (13, 17)  # Palm
+        ]
+        
+        for hand_landmarks in landmarks_cache:
+            # Draw connections
+            for start_idx, end_idx in connections:
+                start = hand_landmarks[start_idx]
+                end = hand_landmarks[end_idx]
+                start_pt = (int(start.x * width), int(start.y * height))
+                end_pt = (int(end.x * width), int(end.y * height))
+                cv2.line(frame, start_pt, end_pt, (0, 255, 0), 2)
+            
+            # Draw landmarks
+            for lm in hand_landmarks:
+                pt = (int(lm.x * width), int(lm.y * height))
+                cv2.circle(frame, pt, 5, (255, 0, 0), -1)
     
     def release(self) -> None:
         """Release MediaPipe resources."""
-        self.hands.close()
+        self.hand_landmarker.close()
     
     def __enter__(self):
         """Context manager entry."""
