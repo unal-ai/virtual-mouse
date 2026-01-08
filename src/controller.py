@@ -137,6 +137,11 @@ class MouseController:
         self.prev_hand_x: Optional[float] = None
         self.prev_hand_y: Optional[float] = None
         
+        # 3-finger drag state
+        self.three_finger_hold_count: int = 0
+        self.three_finger_drag_threshold: int = 4  # reduced for faster activation
+        self.three_finger_dragging: bool = False
+        
         # Pinch control state
         self.pinch_active: bool = False
         self.pinch_start_x: float = 0
@@ -377,18 +382,83 @@ class MouseController:
         
         if gesture not in [Gesture.PINCH_MAJOR, Gesture.PINCH_MINOR] and self.pinch_active:
             self.pinch_active = False
+        # ===== TRACKPAD MODE =====
+        if self.trackpad_mode:
+            # Reset 3-finger state if gesture changes from 3 fingers
+            if gesture != Gesture.THREE_FINGERS:
+                if self.three_finger_dragging:
+                    # Release drag when leaving 3-finger gesture
+                    self.stop_drag()
+                    self.three_finger_dragging = False
+                self.three_finger_hold_count = 0
+            
+            if gesture in [Gesture.V_GEST, Gesture.FIRST2]:
+                # 2 fingers spread = Move cursor
+                # Stop any active drag when entering move mode
+                if self.is_dragging:
+                    self.stop_drag()
+                    self.three_finger_dragging = False
+                
+                self.click_ready = True
+                if hand_position:
+                    self.move_cursor(hand_position[0], hand_position[1])
+                    action = "Moving Cursor"
+            
+            elif gesture == Gesture.TWO_FINGER_CLOSED:
+                # 2 fingers closed = Left Click (immediate, no waiting required)
+                self.prev_hand_x = None
+                self.prev_hand_y = None
+                self.left_click()  # Uses debounce internally
+                action = "Left Click"
+            
+            elif gesture == Gesture.THREE_FINGERS:
+                # 3 fingers = Drag
+                self.three_finger_hold_count += 1
+                
+                if self.three_finger_dragging:
+                    # Already dragging - continue to move cursor while dragging
+                    if hand_position:
+                        self.move_cursor(hand_position[0], hand_position[1])
+                    action = "Dragging"
+                
+                elif self.three_finger_hold_count >= self.three_finger_drag_threshold:
+                    # Held long enough - start drag
+                    self.three_finger_dragging = True
+                    self.start_drag()
+                    action = "Drag Started"
+                
+                else:
+                    action = "3 Fingers (Hold to Drag)"
+                
+                # Reset position on first frame to prevent drift
+                if self.three_finger_hold_count == 1:
+                    self.prev_hand_x = None
+                    self.prev_hand_y = None
+            
+            elif gesture == Gesture.PALM:
+                # PALM (5 fingers) = Back
+                self.prev_hand_x = None
+                self.prev_hand_y = None
+                if self.click_ready:
+                    self.back()
+                    self.click_ready = False
+                    action = "Back"
+                else:
+                    action = "5 Fingers (Waiting...)"
+            
+            else:
+                # FIST, FOUR_FINGERS, or any other = Idle
+                self.prev_hand_x = None
+                self.prev_hand_y = None
+                action = "Idle"
+            
+            return action
         
+        # ===== STANDARD MODE (non-trackpad) =====
         if gesture == Gesture.PALM:
             self.prev_x = None
             self.prev_y = None
-            # In trackpad mode, PALM is Tab
-            if self.trackpad_mode:
-                if self.click_ready:
-                    self.tab()
-                    self.click_ready = False
-                action = "Tab Switch"
-            else:
-                action = "Stop"
+            action = "Stop"
         
         elif gesture == Gesture.V_GEST:
             self.click_ready = True
@@ -397,72 +467,45 @@ class MouseController:
                 action = "Moving Cursor"
         
         elif gesture == Gesture.FIST:
-            if self.trackpad_mode:
-                 # In trackpad mode, skip drag for now as per simplified spec, or map it to something else?
-                 # Spec didn't ask for drag. But FIST is "All fingers closed".
-                 # User asked for:
-                 # Move (V)
-                 # Left Click (Thumb Up) -> Need new gesture enum
-                 # Back (4 fingers) -> Need new gesture enum
-                 # Tab (Palm) -> Handled above
-                 pass
-            else:
-                if not self.is_dragging:
-                    self.start_drag()
-                if hand_position:
-                    self.move_cursor(hand_position[0], hand_position[1])
-                action = "Dragging"
+            if not self.is_dragging:
+                self.start_drag()
+            if hand_position:
+                self.move_cursor(hand_position[0], hand_position[1])
+            action = "Dragging"
         
         elif gesture == Gesture.TWO_FINGER_CLOSED:
-             # Standard mode: click.
-             if not self.trackpad_mode and self.click_ready:
-                 self.left_click()
-                 self.click_ready = False
-                 action = "Left Click"
-        
-        elif gesture == Gesture.THUMB_UP: # New Gesture
-            if self.trackpad_mode and self.click_ready:
+            if self.click_ready:
                 self.left_click()
                 self.click_ready = False
                 action = "Left Click"
-
-        elif gesture == Gesture.FOUR_FINGERS: # New Gesture
-            if self.trackpad_mode and self.click_ready:
-                self.back()
-                self.click_ready = False
-                action = "Back"
-
+        
         elif gesture == Gesture.INDEX and self.click_ready:
-            if not self.trackpad_mode:
-                self.right_click()
-                self.click_ready = False
-                action = "Right Click"
+            self.right_click()
+            self.click_ready = False
+            action = "Right Click"
         
         elif gesture == Gesture.PINCH_MAJOR and self.click_ready:
-             if not self.trackpad_mode:
-                self.double_click()
-                self.click_ready = False
-                action = "Double Click"
+            self.double_click()
+            self.click_ready = False
+            action = "Double Click"
         
         elif gesture == Gesture.PINCH_MINOR:
-            if not self.trackpad_mode:
-                if hand_position:
-                    if not self.pinch_active:
-                        self.pinch_active = True
-                        self.init_pinch_control(hand_position[0], hand_position[1])
-                    else:
-                        self.update_pinch_control(
-                            hand_position[0], hand_position[1],
-                            self.scroll_horizontal, self.scroll_vertical
-                        )
-                action = "Scrolling"
+            if hand_position:
+                if not self.pinch_active:
+                    self.pinch_active = True
+                    self.init_pinch_control(hand_position[0], hand_position[1])
+                else:
+                    self.update_pinch_control(
+                        hand_position[0], hand_position[1],
+                        self.scroll_horizontal, self.scroll_vertical
+                    )
+            action = "Scrolling"
         
         elif gesture == Gesture.MID:
-            if not self.trackpad_mode:
-                self.click_ready = True
-                if hand_position:
-                    self.move_cursor(hand_position[0], hand_position[1])
-                    action = "Moving Cursor"
+            self.click_ready = True
+            if hand_position:
+                self.move_cursor(hand_position[0], hand_position[1])
+                action = "Moving Cursor"
         
         return action
     

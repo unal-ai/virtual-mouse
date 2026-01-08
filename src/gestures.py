@@ -27,24 +27,26 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hand_land
 class Gesture(IntEnum):
     """Gesture encodings using binary representation for finger states."""
     # Binary encoded (each bit represents a finger: pinky, ring, mid, index)
+    # Bit order: Index(8) Middle(4) Ring(2) Pinky(1)
     FIST = 0          # 0000 - All fingers down
     PINKY = 1         # 0001 - Only pinky up
     RING = 2          # 0010 - Only ring up
     MID = 4           # 0100 - Only middle up
     LAST3 = 7         # 0111 - Pinky + Ring + Middle up
     INDEX = 8         # 1000 - Only index up
-    FIRST2 = 12       # 1100 - Index + Middle up
-    LAST4 = 15        # 1111 - All except thumb
-    THUMB = 16        # Thumb up (special case)
-    THUMB_UP = 16     # Thumb up (Fist + Thumb)
-    FOUR_FINGERS = 15 # Four fingers up (Index to Pinky)
-    PALM = 31         # All fingers up
+    FIRST2 = 12       # 1100 - Index + Middle up (2 fingers)
+    FIRST3 = 14       # 1110 - Index + Middle + Ring up (3 fingers)
+    LAST4 = 15        # 1111 - All 4 fingers except thumb
+    FOUR_FINGERS = 15 # Alias for LAST4
+    PALM = 31         # All fingers up (including thumb bit)
     
     # Special gestures (detected through additional logic)
+    THUMB_UP = 32         # Thumb up with fist (detected via _is_thumb_up)
     V_GEST = 33           # V gesture (index + middle spread)
-    TWO_FINGER_CLOSED = 34  # Index + middle together
+    TWO_FINGER_CLOSED = 34  # Index + middle together (for click)
     PINCH_MAJOR = 35      # Pinch with major (dominant) hand
     PINCH_MINOR = 36      # Pinch with minor (non-dominant) hand
+    THREE_FINGERS = 37    # Three fingers extended (for right click in trackpad mode)
     
     UNKNOWN = 99          # Unknown gesture
 
@@ -292,9 +294,16 @@ class HandRecognizer:
                 current = Gesture.THUMB_UP
             else:
                 current = Gesture.FIST
-                
-        elif self.finger == Gesture.LAST4: # 01111 -> 1111 (since self.finger is 4 bits)
-             current = Gesture.FOUR_FINGERS
+        
+        elif self.finger == Gesture.FIRST3:  # 1110 - Index + Middle + Ring
+            current = Gesture.THREE_FINGERS
+        
+        elif self.finger == Gesture.LAST4:  # 1111 - All 4 fingers
+            # If thumb is also up, this is PALM (5 fingers)
+            if thumb_up:
+                current = Gesture.PALM
+            else:
+                current = Gesture.FOUR_FINGERS
 
         else:
             # Try to match to known gesture, fallback to PALM for unrecognized states
@@ -323,7 +332,6 @@ class HandRecognizer:
     # ... (Keep existing methods: get_landmark_position, get_index_tip) ...
 
 
-
     
     def get_landmark_position(self, landmark_idx: int = 9) -> Optional[Tuple[float, float]]:
         """Get normalized position of a specific landmark.
@@ -347,6 +355,27 @@ class HandRecognizer:
             Tuple of (x, y) normalized coordinates, or None if no hand.
         """
         return self.get_landmark_position(8)
+    
+    def get_two_finger_position(self) -> Optional[Tuple[float, float]]:
+        """Get average position of index and middle fingertips.
+        
+        Uses landmarks 8 (index tip) and 12 (middle tip) to calculate
+        a stable position for 2-finger tracking that doesn't shift
+        when other fingers move.
+        
+        Returns:
+            Tuple of (x, y) normalized coordinates, or None if no hand.
+        """
+        if self.hand_result is None or len(self.hand_result.landmark) < 13:
+            return None
+        
+        index_tip = self.hand_result.landmark[8]
+        middle_tip = self.hand_result.landmark[12]
+        
+        avg_x = (index_tip.x + middle_tip.x) / 2
+        avg_y = (index_tip.y + middle_tip.y) / 2
+        
+        return (avg_x, avg_y)
 
 
 class GestureDetector:
@@ -589,14 +618,15 @@ class GestureDetector:
 # Gesture name mapping for display
 GESTURE_NAMES = {
     Gesture.FIST: "Fist",
-    Gesture.PALM: "Palm (Tab)",
+    Gesture.PALM: "Palm",
     Gesture.V_GEST: "V-Gesture (Move)",
     Gesture.INDEX: "Index (Right Click)",
-    Gesture.MID: "Middle (Move)",
-    Gesture.TWO_FINGER_CLOSED: "Closed (Left Click)",
+    Gesture.MID: "Middle",
+    Gesture.TWO_FINGER_CLOSED: "2 Fingers Closed (Click)",
     Gesture.PINCH_MAJOR: "Pinch (Double Click)",
     Gesture.PINCH_MINOR: "Pinch Left (Scroll)",
-    Gesture.FIRST2: "Two Fingers",
+    Gesture.FIRST2: "Two Fingers (Move)",
+    Gesture.THREE_FINGERS: "Three Fingers (Click)",
     Gesture.THUMB_UP: "Thumb Up (Click)",
     Gesture.FOUR_FINGERS: "Four Fingers (Back)",
     Gesture.UNKNOWN: "Unknown"

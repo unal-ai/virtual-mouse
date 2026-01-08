@@ -187,10 +187,10 @@ def run_virtual_mouse(config_path: Optional[str] = None,
     print("  Controls:")
     print("    ESC / Enter  : Exit")
     if config.mouse.trackpad_mode:
-        print("    V-Gesture    : Move cursor (Relative)")
-        print("    Thumb Up     : Left click")
-        print("    Four Fingers : Back")
-        print("    Palm         : Tab Switch")
+        print("    2 Fingers    : Move cursor")
+        print("    2 Fingers ✌️  : Close to Click")
+        print("    3 Fingers    : Hold to Drag")
+        print("    5 Fingers    : Back")
     else:
         print("    V-Gesture    : Move cursor")
         print("    Close fingers: Left click")
@@ -237,7 +237,11 @@ def run_virtual_mouse(config_path: Optional[str] = None,
             action = "No Hand"
             
             if hands_detected:
-                position = hand.get_landmark_position(9) if hand else None
+                # Use 2-finger position in trackpad mode for stable tracking
+                if config.mouse.trackpad_mode:
+                    position = hand.get_two_finger_position() if hand else None
+                else:
+                    position = hand.get_landmark_position(9) if hand else None
                 action = controller.handle_gesture(gesture, position)
             else:
                 controller.reset()  # Reset trackpad state when hand lost
