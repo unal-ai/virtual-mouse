@@ -6,6 +6,7 @@ Provides CLI interface and main processing loop.
 import argparse
 import sys
 import cv2
+import time
 from typing import Optional
 
 from .config import load_config, CameraConfig
@@ -84,6 +85,24 @@ Examples:
         '--demo', '--trackpad',
         action='store_true',
         help='Enable trackpad mode (simplifed gestures, relative movement)'
+    )
+    
+    parser.add_argument(
+        '--discover',
+        action='store_true',
+        help='Scan network for RTSP streams (requires zeroconf)'
+    )
+    
+    parser.add_argument(
+        '--auto-connect',
+        action='store_true',
+        help='Automatically connect to "Virtual Mouse" RTSP stream if found'
+    )
+
+    parser.add_argument(
+        '--rtsp-wait',
+        action='store_true',
+        help='Wait indefinitely for "Virtual Mouse" RTSP stream (implies --auto-connect)'
     )
     
     return parser.parse_args()
@@ -201,8 +220,24 @@ def run_virtual_mouse(config_path: Optional[str] = None,
         print("    Palm         : Stop")
     print("=" * 50)
     
+    # Create smart discovery callback for RTSP self-healing
+    smart_discovery = None
+    if config.mouse.trackpad_mode: 
+        def smart_discovery_cb() -> Optional[str]:
+            # This callback is triggered by VideoInput when reconnection fails repeatedly
+            try:
+                from .rtsp_discovery import discover_rtsp_streams
+                # Check for new stream location
+                streams = discover_rtsp_streams(timeout=2.0, auto_connect=True)
+                if streams:
+                    return streams[0].url
+            except ImportError:
+                pass
+            return None
+        smart_discovery = smart_discovery_cb
+
     # Initialize components
-    video = VideoInput(config.camera)
+    video = VideoInput(config.camera, on_reconnect_fail=smart_discovery)
     detector = GestureDetector(config.gesture)
     controller = MouseController(config.mouse)
     
@@ -222,10 +257,24 @@ def run_virtual_mouse(config_path: Optional[str] = None,
             success, frame = video.read()
             
             if not success:
-                if frame is None:
-                    print("Warning: Empty frame received")
+                # For RTSP streams, the reconnection logic in video.read() handles it
+                # Just continue the loop and wait for frames
+                if video._is_rtsp:
+                    # Show reconnecting status
+                    if config.display.show_preview:
+                        status_frame = frame if frame is not None else None
+                        if status_frame is None:
+                            # Create a blank frame for status display
+                            import numpy as np
+                            status_frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                            cv2.putText(status_frame, "Reconnecting to RTSP...", (50, 240),
+                                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                            cv2.imshow('Virtual Mouse', status_frame)
+                            cv2.waitKey(100)
                     continue
-                break
+                else:
+                    print("Warning: Frame read failed")
+                    break
             
             # Submit frame for async processing (non-blocking)
             detector.process_async(frame)
@@ -299,6 +348,34 @@ def main() -> int:
     """
     args = parse_args()
     
+    # Handle --discover separately
+    if args.discover:
+        from .rtsp_discovery import main as discover_main
+        return discover_main()
+
+    # Handle --auto-connect or --rtsp-wait
+    if args.auto_connect or args.rtsp_wait:
+        print("Auto-connecting to Virtual Mouse stream...")
+        try:
+            from .rtsp_discovery import discover_rtsp_streams
+            
+            while True:
+                streams = discover_rtsp_streams(timeout=2.0, auto_connect=True)
+                if streams:
+                    print(f"Found trusted stream: {streams[0].name}")
+                    args.source = streams[0].url
+                    break
+                
+                if not args.rtsp_wait:
+                    print("No Virtual Mouse stream found. Falling back to default.")
+                    break
+                
+                print("Waiting for Virtual Mouse stream... (Scanning)")
+                time.sleep(1.0)
+                
+        except ImportError:
+            print("Warning: zeroconf not installed, skipping auto-connect.")
+
     # Determine flip setting
     flip = None
     if args.flip:

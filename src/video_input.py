@@ -8,24 +8,27 @@ Supports multiple video sources:
 
 import cv2
 import time
-from typing import Optional, Tuple, Union, Generator
+from typing import Optional, Tuple, Union, Generator, Callable
 from .config import CameraConfig
 
 
 class VideoInput:
     """Unified video input handler with auto-reconnect for RTSP streams."""
     
-    def __init__(self, config: CameraConfig):
+    def __init__(self, config: CameraConfig, on_reconnect_fail: Optional[Callable[[], Optional[str]]] = None):
         """Initialize video input.
         
         Args:
             config: Camera configuration object.
+            on_reconnect_fail: Callback function to run when reconnection fails.
+                              Should return new RTSP URL if found, or None.
         """
         self.config = config
         self.cap: Optional[cv2.VideoCapture] = None
         self._reconnect_delay = 2.0  # seconds
         self._max_reconnect_attempts = 5
         self._is_rtsp = isinstance(config.source, str) and config.source.startswith("rtsp://")
+        self._on_reconnect_fail = on_reconnect_fail
         
     def open(self) -> bool:
         """Open the video capture device.
@@ -84,24 +87,52 @@ class VideoInput:
         return True, frame
     
     def _reconnect(self) -> bool:
-        """Attempt to reconnect to RTSP stream.
+        """Attempt to reconnect to RTSP stream with exponential backoff.
+        
+        Uses infinite retry for RTSP streams - keeps trying until success.
         
         Returns:
-            True if reconnected successfully, False otherwise.
+            True if reconnected successfully, False to signal temporary failure.
         """
-        for attempt in range(self._max_reconnect_attempts):
-            print(f"Reconnect attempt {attempt + 1}/{self._max_reconnect_attempts}...")
-            time.sleep(self._reconnect_delay)
+        delay = self._reconnect_delay
+        max_delay = 30.0  # Cap at 30 seconds
+        attempt = 0
+        
+        while True:
+            attempt += 1
+            print(f"Reconnect attempt {attempt} (waiting {delay:.1f}s)...")
+            
+            # Smart Reconnection: Check for new stream URL every few attempts
+            if attempt % 3 == 0 and self._on_reconnect_fail:
+                print("Checking for new stream location...")
+                new_url = self._on_reconnect_fail()
+                if new_url and new_url != self.config.source:
+                    print(f"Found new stream URL: {new_url}")
+                    self.config.source = new_url
+                    attempt = 0 # Reset attempts for new URL
+                    delay = self._reconnect_delay # Reset delay
+            
+            time.sleep(delay)
             
             if self.cap is not None:
                 self.cap.release()
             
-            if self.open():
-                print("Reconnected successfully!")
-                return True
-        
-        print("Failed to reconnect after maximum attempts.")
-        return False
+            try:
+                self.cap = cv2.VideoCapture(self.config.source)
+                if self.cap.isOpened():
+                    # Test read to confirm connection
+                    ret, _ = self.cap.read()
+                    if ret:
+                        self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                        self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                        print(f"Reconnected successfully! Resolution: {self.width}x{self.height}")
+                        return True
+            except Exception as e:
+                print(f"Reconnect error: {e}")
+            
+            # Exponential backoff with cap
+            delay = min(delay * 1.5, max_delay)
+            print(f"Connection failed, retrying...")
     
     def frames(self) -> Generator[Tuple[bool, Optional["cv2.Mat"]], None, None]:
         """Generator that yields frames continuously.
@@ -144,7 +175,8 @@ class VideoInput:
 def create_video_input(source: Union[int, str], 
                        width: int = 640, 
                        height: int = 480,
-                       flip: bool = True) -> VideoInput:
+                       flip: bool = True,
+                       on_reconnect_fail: Optional[Callable[[], Optional[str]]] = None) -> VideoInput:
     """Create a VideoInput with the given parameters.
     
     Args:
@@ -162,4 +194,4 @@ def create_video_input(source: Union[int, str],
         height=height,
         flip_horizontal=flip
     )
-    return VideoInput(config)
+    return VideoInput(config, on_reconnect_fail)
