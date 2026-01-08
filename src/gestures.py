@@ -36,6 +36,8 @@ class Gesture(IntEnum):
     FIRST2 = 12       # 1100 - Index + Middle up
     LAST4 = 15        # 1111 - All except thumb
     THUMB = 16        # Thumb up (special case)
+    THUMB_UP = 16     # Thumb up (Fist + Thumb)
+    FOUR_FINGERS = 15 # Four fingers up (Index to Pinky)
     PALM = 31         # All fingers up
     
     # Special gestures (detected through additional logic)
@@ -63,32 +65,51 @@ class NormalizedLandmark(NamedTuple):
 class HandLandmarksWrapper:
     """Wrapper to provide the old .landmark interface for new API results."""
     
-    def __init__(self, landmarks_list):
-        """Wrap a list of NormalizedLandmarks from new API."""
+    def __init__(self, landmarks_list, score: float = 0.0, world_landmarks_list=None):
+        """Wrap a list of NormalizedLandmarks from new API.
+        
+        Args:
+            landmarks_list: List of normalized landmarks (x, y, z in 0-1 range).
+            score: Detection confidence score.
+            world_landmarks_list: Optional list of world landmarks (x, y, z in meters).
+        """
         self.landmark = [
             NormalizedLandmark(lm.x, lm.y, lm.z) 
             for lm in landmarks_list
         ]
+        self.score = score
+        
+        # World landmarks in real-world meters (more accurate for 3D calculations)
+        if world_landmarks_list:
+            self.world_landmark = [
+                NormalizedLandmark(lm.x, lm.y, lm.z)
+                for lm in world_landmarks_list
+            ]
+        else:
+            self.world_landmark = None
 
 
 class HandRecognizer:
     """Recognizes gestures from hand landmarks."""
     
-    def __init__(self, hand_label: HandLabel, stability_frames: int = 4):
+    def __init__(self, hand_label: HandLabel, stability_frames: int = 4, thumb_sensitivity: float = 1.0):
         """Initialize hand recognizer.
         
         Args:
             hand_label: Whether this is the major or minor hand.
             stability_frames: Number of frames to wait before confirming gesture change.
+            thumb_sensitivity: Multiplier for thumb detection threshold (higher = stricter).
         """
         self.hand_label = hand_label
         self.stability_frames = stability_frames
+        self.thumb_sensitivity = thumb_sensitivity
         
         self.finger: int = 0
         self.current_gesture: Gesture = Gesture.PALM
         self.prev_gesture: Gesture = Gesture.PALM
         self.stable_gesture: Gesture = Gesture.PALM
         self.frame_count: int = 0
+        self.thumb_up_state: bool = False
         
         self.hand_result = None
     
@@ -99,6 +120,24 @@ class HandRecognizer:
             hand_landmarks: HandLandmarksWrapper with landmarks.
         """
         self.hand_result = hand_landmarks
+
+    @property
+    def score(self) -> float:
+        """Get detection confidence score."""
+        return self.hand_result.score if self.hand_result else 0.0
+
+    @property
+    def raw_gesture(self) -> Gesture:
+        """Get instantaneous gesture (before stability filter)."""
+        return self.current_gesture
+
+    @property
+    def finger_state(self) -> int:
+        """Get bitmask of detected fingers."""
+        state = self.finger
+        if self.thumb_up_state:
+            state |= 16  # Add 5th bit for thumb
+        return state
     
     def _get_signed_distance(self, points: List[int]) -> float:
         """Calculate signed distance between two landmark points.
@@ -192,6 +231,24 @@ class HandRecognizer:
             self.finger = self.finger << 1
             if ratio > 0.5:
                 self.finger = self.finger | 1
+                
+    def _is_thumb_up(self) -> bool:
+        """Check if thumb is up/extended."""
+        if self.hand_result is None:
+            return False
+            
+        # Check angle or distance of thumb
+        # 1. Check if Tip(4) is far from Pinky MCP(17) - implies open hand or thumb out
+        dist_thumb_pinky = self._get_distance([4, 17])
+        
+        # 2. Check if Thumb Tip(4) is further from MCP(2) than IP(3) is from MCP(2)
+        # Using simple distance check vs Index finger MCP(5) as reference for scale
+        scale_ref = self._get_distance([5, 17]) # Width of palm
+        
+        if scale_ref == 0:
+            return False
+            
+        return dist_thumb_pinky > (scale_ref * self.thumb_sensitivity)
     
     def get_gesture(self) -> Gesture:
         """Get the current stable gesture.
@@ -203,6 +260,8 @@ class HandRecognizer:
             return Gesture.PALM
         
         self._detect_finger_state()
+        thumb_up = self._is_thumb_up()
+        self.thumb_up_state = thumb_up
         
         # Determine current gesture
         current = Gesture.PALM
@@ -226,6 +285,17 @@ class HandRecognizer:
                     current = Gesture.TWO_FINGER_CLOSED
                 else:
                     current = Gesture.MID
+                    
+        elif self.finger == Gesture.FIST:
+            # Check for Thumb Up
+            if thumb_up:
+                current = Gesture.THUMB_UP
+            else:
+                current = Gesture.FIST
+                
+        elif self.finger == Gesture.LAST4: # 01111 -> 1111 (since self.finger is 4 bits)
+             current = Gesture.FOUR_FINGERS
+
         else:
             # Try to match to known gesture, fallback to PALM for unrecognized states
             try:
@@ -233,6 +303,8 @@ class HandRecognizer:
             except ValueError:
                 # Finger state doesn't match any defined gesture
                 current = Gesture.PALM
+        
+        self.current_gesture = current
         
         # Stability filtering
         if current == self.prev_gesture:
@@ -246,6 +318,12 @@ class HandRecognizer:
             self.stable_gesture = current
         
         return self.stable_gesture
+
+
+    # ... (Keep existing methods: get_landmark_position, get_index_tip) ...
+
+
+
     
     def get_landmark_position(self, landmark_idx: int = 9) -> Optional[Tuple[float, float]]:
         """Get normalized position of a specific landmark.
@@ -303,8 +381,8 @@ class GestureDetector:
         self.hand_landmarker = vision.HandLandmarker.create_from_options(options)
         
         # Hand recognizers
-        self.major_hand = HandRecognizer(HandLabel.MAJOR, config.stability_frames)
-        self.minor_hand = HandRecognizer(HandLabel.MINOR, config.stability_frames)
+        self.major_hand = HandRecognizer(HandLabel.MAJOR, config.stability_frames, config.thumb_sensitivity)
+        self.minor_hand = HandRecognizer(HandLabel.MINOR, config.stability_frames, config.thumb_sensitivity)
         
         # Dominant hand setting (True = right-handed)
         self.dom_hand_right = True
@@ -365,12 +443,28 @@ class GestureDetector:
         self.major_hand.update(major_landmarks)
         self.minor_hand.update(minor_landmarks)
         
-        # Get gesture (prioritize minor hand pinch)
+        # Get gestures
         minor_gesture = self.minor_hand.get_gesture()
-        if minor_gesture == Gesture.PINCH_MINOR:
-            return True, minor_gesture, self.minor_hand
-        
         major_gesture = self.major_hand.get_gesture()
+        
+        # Priority Logic:
+        # 1. If Major hand has active gesture (not PALM), use Major.
+        # 2. If Minor hand has active gesture (not PALM), use Minor.
+        # 3. If both PALM, return the one that is actually detected (score > 0).
+        # 4. Fallback to Major.
+        
+        if major_gesture != Gesture.PALM:
+             return True, major_gesture, self.major_hand
+        elif minor_gesture != Gesture.PALM:
+             return True, minor_gesture, self.minor_hand
+        
+        # Both are PALM/Idle, check presence
+        if self.major_hand.score > 0:
+            return True, major_gesture, self.major_hand
+        elif self.minor_hand.score > 0:
+            return True, minor_gesture, self.minor_hand
+            
+        # Default to major hand if both missing
         return True, major_gesture, self.major_hand
     
     def _classify_hands_from_result(self, result) -> Tuple[Optional[HandLandmarksWrapper], Optional[HandLandmarksWrapper]]:
@@ -389,8 +483,14 @@ class GestureDetector:
             try:
                 handedness = result.handedness[i][0]
                 label = handedness.category_name
+                score = handedness.score
                 
-                wrapped = HandLandmarksWrapper(hand_landmarks)
+                # Get world landmarks if available
+                world_landmarks = None
+                if hasattr(result, 'hand_world_landmarks') and i < len(result.hand_world_landmarks):
+                    world_landmarks = result.hand_world_landmarks[i]
+                
+                wrapped = HandLandmarksWrapper(hand_landmarks, score, world_landmarks)
                 
                 if label == 'Right':
                     right = wrapped
@@ -488,16 +588,18 @@ class GestureDetector:
 
 # Gesture name mapping for display
 GESTURE_NAMES = {
-    Gesture.FIST: "✊ Fist (Drag)",
-    Gesture.PALM: "🖐 Palm (Stop)",
-    Gesture.V_GEST: "✌️ V-Gesture (Move)",
-    Gesture.INDEX: "☝️ Index (Right Click)",
-    Gesture.MID: "🖕 Middle (Move)",
-    Gesture.TWO_FINGER_CLOSED: "✌️ Closed (Left Click)",
-    Gesture.PINCH_MAJOR: "🤏 Pinch (Double Click)",
-    Gesture.PINCH_MINOR: "🤏 Pinch Left (Scroll)",
-    Gesture.FIRST2: "✌️ Two Fingers",
-    Gesture.UNKNOWN: "❓ Unknown"
+    Gesture.FIST: "Fist",
+    Gesture.PALM: "Palm (Tab)",
+    Gesture.V_GEST: "V-Gesture (Move)",
+    Gesture.INDEX: "Index (Right Click)",
+    Gesture.MID: "Middle (Move)",
+    Gesture.TWO_FINGER_CLOSED: "Closed (Left Click)",
+    Gesture.PINCH_MAJOR: "Pinch (Double Click)",
+    Gesture.PINCH_MINOR: "Pinch Left (Scroll)",
+    Gesture.FIRST2: "Two Fingers",
+    Gesture.THUMB_UP: "Thumb Up (Click)",
+    Gesture.FOUR_FINGERS: "Four Fingers (Back)",
+    Gesture.UNKNOWN: "Unknown"
 }
 
 

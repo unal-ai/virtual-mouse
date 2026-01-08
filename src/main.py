@@ -10,7 +10,7 @@ from typing import Optional
 
 from .config import load_config, CameraConfig
 from .video_input import VideoInput
-from .gestures import GestureDetector, get_gesture_name, Gesture
+from .gestures import GestureDetector, get_gesture_name, Gesture, HandRecognizer
 from .controller import MouseController
 
 
@@ -80,10 +80,16 @@ Examples:
         help='Disable horizontal flip'
     )
     
+    parser.add_argument(
+        '--demo', '--trackpad',
+        action='store_true',
+        help='Enable trackpad mode (simplifed gestures, relative movement)'
+    )
+    
     return parser.parse_args()
 
 
-def draw_info_overlay(frame, gesture: Gesture, action: str, fps: float) -> None:
+def draw_info_overlay(frame, gesture: Gesture, action: str, fps: float, hand: Optional[HandRecognizer] = None) -> None:
     """Draw information overlay on the frame.
     
     Args:
@@ -91,15 +97,16 @@ def draw_info_overlay(frame, gesture: Gesture, action: str, fps: float) -> None:
         gesture: Current detected gesture.
         action: Current action being performed.
         fps: Current frames per second.
+        hand: HandRecognizer instance for debug info.
     """
     height, width = frame.shape[:2]
     
-    # Semi-transparent background for text
+    # Semi-transparent background for text (larger for debug info)
     overlay = frame.copy()
-    cv2.rectangle(overlay, (10, 10), (350, 100), (0, 0, 0), -1)
+    cv2.rectangle(overlay, (10, 10), (450, 160), (0, 0, 0), -1)
     cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
     
-    # Gesture name
+    # Gesture name (Stable)
     gesture_text = get_gesture_name(gesture)
     cv2.putText(frame, f"Gesture: {gesture_text}", (20, 35),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
@@ -111,8 +118,19 @@ def draw_info_overlay(frame, gesture: Gesture, action: str, fps: float) -> None:
     # FPS
     cv2.putText(frame, f"FPS: {fps:.1f}", (20, 85),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-    
-    # Instructions at bottom
+                
+    if hand:
+        # Debug Info
+        score = hand.score
+        raw_g = get_gesture_name(hand.raw_gesture).split('(')[0].strip() # Short name
+        fingers = f"{hand.finger_state:05b}" # Binary representation
+        
+        cv2.putText(frame, f"Score: {score:.2f} | P: {fingers}", (20, 110),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+        cv2.putText(frame, f"Raw: {raw_g}", (20, 135),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+
+    # Instructions at bottom...
     cv2.putText(frame, "Press ESC or Enter to exit", (10, height - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
@@ -121,7 +139,8 @@ def run_virtual_mouse(config_path: Optional[str] = None,
                      source: Optional[str] = None,
                      headless: bool = False,
                      show_landmarks: bool = True,
-                     flip: Optional[bool] = None) -> int:
+                     flip: Optional[bool] = None,
+                     demo_mode: bool = False) -> int:
     """Run the virtual mouse application.
     
     Args:
@@ -130,9 +149,7 @@ def run_virtual_mouse(config_path: Optional[str] = None,
         headless: Run without preview window.
         show_landmarks: Draw hand landmarks.
         flip: Horizontal flip override.
-    
-    Returns:
-        Exit code (0 for success).
+        demo_mode: Enable trackpad/demo mode.
     """
     # Load configuration
     config = load_config(config_path)
@@ -147,6 +164,10 @@ def run_virtual_mouse(config_path: Optional[str] = None,
     
     if flip is not None:
         config.camera.flip_horizontal = flip
+        
+    if demo_mode:
+        config.mouse.trackpad_mode = True
+        config.mouse.trackpad_sensitivity = 2.0 # Default High sensitivity for trackpad
     
     if headless:
         config.display.show_preview = False
@@ -155,20 +176,29 @@ def run_virtual_mouse(config_path: Optional[str] = None,
         config.display.show_landmarks = False
     
     print("=" * 50)
-    print("  AI Virtual Mouse - Gesture Control System")
+    if config.mouse.trackpad_mode:
+        print("  AI Virtual Mouse - Trackpad Mode (Demo)")
+    else:
+        print("  AI Virtual Mouse - Gesture Control System")
     print("=" * 50)
     print(f"  Video source: {config.camera.source}")
     print(f"  Preview: {'Enabled' if config.display.show_preview else 'Disabled'}")
     print("=" * 50)
     print("  Controls:")
     print("    ESC / Enter  : Exit")
-    print("    ✌️ V-Gesture    : Move cursor")
-    print("    ✌️ Close fingers: Left click")
-    print("    ☝️ Index only   : Right click")
-    print("    🤏 Pinch        : Double click")
-    print("    ✊ Fist         : Drag")
-    print("    🤏 Left pinch   : Scroll")
-    print("    🖐 Palm         : Stop")
+    if config.mouse.trackpad_mode:
+        print("    V-Gesture    : Move cursor (Relative)")
+        print("    Thumb Up     : Left click")
+        print("    Four Fingers : Back")
+        print("    Palm         : Tab Switch")
+    else:
+        print("    V-Gesture    : Move cursor")
+        print("    Close fingers: Left click")
+        print("    Index only   : Right click")
+        print("    Pinch        : Double click")
+        print("    Fist         : Drag")
+        print("    Left pinch   : Scroll")
+        print("    Palm         : Stop")
     print("=" * 50)
     
     # Initialize components
@@ -210,7 +240,7 @@ def run_virtual_mouse(config_path: Optional[str] = None,
                 position = hand.get_landmark_position(9) if hand else None
                 action = controller.handle_gesture(gesture, position)
             else:
-                controller.reset()
+                controller.reset()  # Reset trackpad state when hand lost
             
             # Calculate FPS
             frame_count += 1
@@ -228,7 +258,7 @@ def run_virtual_mouse(config_path: Optional[str] = None,
                 
                 # Draw info overlay
                 if config.display.show_gesture:
-                    draw_info_overlay(frame, gesture, action, fps)
+                    draw_info_overlay(frame, gesture, action, fps, hand)
                 
                 # Apply scale
                 if config.display.preview_scale != 1.0:
@@ -277,7 +307,8 @@ def main() -> int:
         source=args.source,
         headless=args.headless,
         show_landmarks=not args.no_landmarks,
-        flip=flip
+        flip=flip,
+        demo_mode=args.demo
     )
 
 

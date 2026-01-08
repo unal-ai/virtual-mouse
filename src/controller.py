@@ -131,6 +131,12 @@ class MouseController:
         self.click_ready: bool = False
         self.last_click_time: float = 0
         
+        # Trackpad mode state
+        self.trackpad_mode: bool = config.trackpad_mode
+        self.trackpad_sensitivity: float = config.trackpad_sensitivity
+        self.prev_hand_x: Optional[float] = None
+        self.prev_hand_y: Optional[float] = None
+        
         # Pinch control state
         self.pinch_active: bool = False
         self.pinch_start_x: float = 0
@@ -174,6 +180,10 @@ class MouseController:
                     pyautogui.keyDown('shift')
                     pyautogui.scroll(args[0])
                     pyautogui.keyUp('shift')
+                elif action == 'back':
+                    pyautogui.hotkey('command', '[')
+                elif action == 'tab':
+                    pyautogui.hotkey('command', 'tab')
                 
                 self._command_queue.task_done()
             except queue.Empty:
@@ -213,26 +223,53 @@ class MouseController:
         - Slow movement -> strong smoothing (removes jitter)
         - Fast movement -> weak smoothing (responsive)
         """
-        if self.config.screen_region.enabled:
-            region = self.config.screen_region
-            x = region.x + norm_x * region.width
-            y = region.y + norm_y * region.height
+        if not self.trackpad_mode:
+            # Absolute positioning (Touchscreen mode)
+            if self.config.screen_region.enabled:
+                region = self.config.screen_region
+                x = region.x + norm_x * region.width
+                y = region.y + norm_y * region.height
+            else:
+                x = norm_x * self.screen_width
+                y = norm_y * self.screen_height
+        
+            # Apply One Euro Filter for smooth, low-latency tracking
+            t = time.time()
+            smooth_x = self._filter_x.filter(x, t)
+            smooth_y = self._filter_y.filter(y, t)
+            
+            smooth_x = max(0, min(self.screen_width - 1, smooth_x))
+            smooth_y = max(0, min(self.screen_height - 1, smooth_y))
+            
+            self._curr_x = smooth_x
+            self._curr_y = smooth_y
+            
+            self._send_command('move', int(smooth_x), int(smooth_y))
+
         else:
-            x = norm_x * self.screen_width
-            y = norm_y * self.screen_height
-        
-        # Apply One Euro Filter for smooth, low-latency tracking
-        t = time.time()
-        smooth_x = self._filter_x.filter(x, t)
-        smooth_y = self._filter_y.filter(y, t)
-        
-        smooth_x = max(0, min(self.screen_width - 1, smooth_x))
-        smooth_y = max(0, min(self.screen_height - 1, smooth_y))
-        
-        self._curr_x = smooth_x
-        self._curr_y = smooth_y
-        
-        self._send_command('move', int(smooth_x), int(smooth_y))
+            # Relative positioning (Trackpad mode)
+            if self.prev_hand_x is None:
+                self.prev_hand_x = norm_x
+                self.prev_hand_y = norm_y
+                return
+            
+            # Calculate delta with sensitivity
+            delta_x = (norm_x - self.prev_hand_x) * self.screen_width * self.trackpad_sensitivity
+            delta_y = (norm_y - self.prev_hand_y) * self.screen_height * self.trackpad_sensitivity
+            
+            # Update current cursor position
+            self._curr_x += delta_x
+            self._curr_y += delta_y
+            
+            # Clamp to screen
+            self._curr_x = max(0, min(self.screen_width - 1, self._curr_x))
+            self._curr_y = max(0, min(self.screen_height - 1, self._curr_y))
+            
+            # Update previous hand position
+            self.prev_hand_x = norm_x
+            self.prev_hand_y = norm_y
+            
+            self._send_command('move', int(self._curr_x), int(self._curr_y))
     
     def left_click(self) -> None:
         """Perform left click (non-blocking)."""
@@ -248,6 +285,16 @@ class MouseController:
         """Perform double click (non-blocking)."""
         if self._can_click():
             self._send_command('double_click')
+
+    def back(self) -> None:
+        """Perform back action (non-blocking)."""
+        if self._can_click():
+            self._send_command('back')
+
+    def tab(self) -> None:
+        """Perform tab switch action (non-blocking)."""
+        if self._can_click():
+            self._send_command('tab')
     
     def start_drag(self) -> None:
         """Start drag operation."""
@@ -320,6 +367,11 @@ class MouseController:
         """Handle a detected gesture and perform corresponding action."""
         action = "Idle"
         
+        # Reset trackpad state if no hand position (hand lost)
+        if hand_position is None and self.prev_hand_x is not None:
+            self.prev_hand_x = None
+            self.prev_hand_y = None
+
         if gesture != Gesture.FIST and self.is_dragging:
             self.stop_drag()
         
@@ -329,7 +381,14 @@ class MouseController:
         if gesture == Gesture.PALM:
             self.prev_x = None
             self.prev_y = None
-            action = "Stop"
+            # In trackpad mode, PALM is Tab
+            if self.trackpad_mode:
+                if self.click_ready:
+                    self.tab()
+                    self.click_ready = False
+                action = "Tab Switch"
+            else:
+                action = "Stop"
         
         elif gesture == Gesture.V_GEST:
             self.click_ready = True
@@ -338,44 +397,72 @@ class MouseController:
                 action = "Moving Cursor"
         
         elif gesture == Gesture.FIST:
-            if not self.is_dragging:
-                self.start_drag()
-            if hand_position:
-                self.move_cursor(hand_position[0], hand_position[1])
-            action = "Dragging"
+            if self.trackpad_mode:
+                 # In trackpad mode, skip drag for now as per simplified spec, or map it to something else?
+                 # Spec didn't ask for drag. But FIST is "All fingers closed".
+                 # User asked for:
+                 # Move (V)
+                 # Left Click (Thumb Up) -> Need new gesture enum
+                 # Back (4 fingers) -> Need new gesture enum
+                 # Tab (Palm) -> Handled above
+                 pass
+            else:
+                if not self.is_dragging:
+                    self.start_drag()
+                if hand_position:
+                    self.move_cursor(hand_position[0], hand_position[1])
+                action = "Dragging"
         
-        elif gesture == Gesture.TWO_FINGER_CLOSED and self.click_ready:
-            self.left_click()
-            self.click_ready = False
-            action = "Left Click"
+        elif gesture == Gesture.TWO_FINGER_CLOSED:
+             # Standard mode: click.
+             if not self.trackpad_mode and self.click_ready:
+                 self.left_click()
+                 self.click_ready = False
+                 action = "Left Click"
         
+        elif gesture == Gesture.THUMB_UP: # New Gesture
+            if self.trackpad_mode and self.click_ready:
+                self.left_click()
+                self.click_ready = False
+                action = "Left Click"
+
+        elif gesture == Gesture.FOUR_FINGERS: # New Gesture
+            if self.trackpad_mode and self.click_ready:
+                self.back()
+                self.click_ready = False
+                action = "Back"
+
         elif gesture == Gesture.INDEX and self.click_ready:
-            self.right_click()
-            self.click_ready = False
-            action = "Right Click"
+            if not self.trackpad_mode:
+                self.right_click()
+                self.click_ready = False
+                action = "Right Click"
         
         elif gesture == Gesture.PINCH_MAJOR and self.click_ready:
-            self.double_click()
-            self.click_ready = False
-            action = "Double Click"
+             if not self.trackpad_mode:
+                self.double_click()
+                self.click_ready = False
+                action = "Double Click"
         
         elif gesture == Gesture.PINCH_MINOR:
-            if hand_position:
-                if not self.pinch_active:
-                    self.pinch_active = True
-                    self.init_pinch_control(hand_position[0], hand_position[1])
-                else:
-                    self.update_pinch_control(
-                        hand_position[0], hand_position[1],
-                        self.scroll_horizontal, self.scroll_vertical
-                    )
-            action = "Scrolling"
+            if not self.trackpad_mode:
+                if hand_position:
+                    if not self.pinch_active:
+                        self.pinch_active = True
+                        self.init_pinch_control(hand_position[0], hand_position[1])
+                    else:
+                        self.update_pinch_control(
+                            hand_position[0], hand_position[1],
+                            self.scroll_horizontal, self.scroll_vertical
+                        )
+                action = "Scrolling"
         
         elif gesture == Gesture.MID:
-            self.click_ready = True
-            if hand_position:
-                self.move_cursor(hand_position[0], hand_position[1])
-                action = "Moving Cursor"
+            if not self.trackpad_mode:
+                self.click_ready = True
+                if hand_position:
+                    self.move_cursor(hand_position[0], hand_position[1])
+                    action = "Moving Cursor"
         
         return action
     
@@ -386,6 +473,8 @@ class MouseController:
         self.stop_drag()
         self.pinch_active = False
         self.click_ready = False
+        self.prev_hand_x = None
+        self.prev_hand_y = None
     
     def shutdown(self) -> None:
         """Shutdown the worker thread."""

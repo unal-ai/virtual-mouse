@@ -20,6 +20,7 @@ class GestureConfig:
     tracking_confidence: float = 0.5
     smoothing_factor: float = 0.3
     stability_frames: int = 4
+    thumb_sensitivity: float = 1.2
 
 
 @dataclass
@@ -36,6 +37,8 @@ class MouseConfig:
     screen_region: ScreenRegion = field(default_factory=ScreenRegion)
     sensitivity: float = 1.0
     click_debounce: float = 0.3
+    trackpad_mode: bool = False
+    trackpad_sensitivity: float = 2.0
 
 
 @dataclass
@@ -93,7 +96,8 @@ def load_config(config_path: Optional[str] = None) -> Config:
                     detection_confidence=gest.get('detection_confidence', 0.7),
                     tracking_confidence=gest.get('tracking_confidence', 0.5),
                     smoothing_factor=gest.get('smoothing_factor', 0.3),
-                    stability_frames=gest.get('stability_frames', 4)
+                    stability_frames=gest.get('stability_frames', 4),
+                    thumb_sensitivity=gest.get('thumb_sensitivity', 1.2)
                 )
             
             # Load display settings
@@ -120,7 +124,9 @@ def load_config(config_path: Optional[str] = None) -> Config:
                 config.mouse = MouseConfig(
                     screen_region=screen_region,
                     sensitivity=mouse.get('sensitivity', 1.0),
-                    click_debounce=mouse.get('click_debounce', 0.3)
+                    click_debounce=mouse.get('click_debounce', 0.3),
+                    trackpad_mode=mouse.get('trackpad_mode', False),
+                    trackpad_sensitivity=mouse.get('trackpad_sensitivity', 2.0)
                 )
                 
         except Exception as e:
